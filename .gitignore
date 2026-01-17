@@ -1,0 +1,35 @@
+# Dependencias
+node_modules/
+
+# Variables de entorno
+.env
+.env.local
+.env.*.local
+
+# Certificados AFIP (sensibles - NO subir)
+src/servicios/certs/*.key
+src/servicios/certs/*.crt
+src/servicios/certs/*.pem
+src/servicios/certs/*.p12
+
+# Logs
+*.log
+npm-debug.log*
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Build
+dist/
+build/
+
+# Temporales
+*.tmp
+*.temp

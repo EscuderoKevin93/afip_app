@@ -1,0 +1,6 @@
+# Esta carpeta contiene los certificados de AFIP
+# Coloca aquí tus archivos:
+# - key.key (clave privada)
+# - cert.crt (certificado)
+#
+# IMPORTANTE: Estos archivos son sensibles y NO deben subirse a git
