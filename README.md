@@ -44,6 +44,8 @@ src/servicios/certs/
 └── cert.crt   # Certificado
 ```
 
+> 📄 **[Ver guía completa de certificados ARCA](CERTIFICADOS.md)** - Paso a paso para obtener tu certificado
+
 ## Ejecutar
 
 ```bash
