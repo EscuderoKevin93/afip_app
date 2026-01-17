@@ -2,6 +2,16 @@
 
 API REST para facturación electrónica con AFIP/ARCA Argentina.
 
+---
+
+> **Nota:** Esta es una aplicación que desarrollé hace tiempo para mi uso personal. La documentación fue generada con ayuda de IA. La aplicación funciona correctamente y la utilizo activamente en mi negocio para generar **Facturas A y B**.
+>
+> El uso es **completamente gratuito**. Si encuentran algún problema o quieren que agregue alguna funcionalidad, simplemente creen un **Issue** y lo reviso.
+>
+> ¡Gracias por usar esta herramienta!
+
+---
+
 ## Instalación
 
 ```bash
