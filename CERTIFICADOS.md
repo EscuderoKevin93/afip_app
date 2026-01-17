@@ -2,7 +2,9 @@
 
 Para usar esta API necesitás obtener un **certificado digital** y su correspondiente **key** de ARCA (ex AFIP).
 
-> Esta guía está basada en la documentación de [Afip SDK](https://afipsdk.com), una excelente herramienta para integraciones con ARCA.
+> **Créditos:** Esta documentación fue tomada de [Afip SDK](https://afipsdk.com). Gracias por hacer esta guía pública y accesible para la comunidad.
+>
+> Si los autores de Afip SDK necesitan que remueva esta documentación, no hay problema, simplemente contactenme y la elimino.
 
 ---
 
