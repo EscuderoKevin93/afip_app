@@ -1,14 +1,10 @@
 # AFIP/ARCA Facturación API
 
-API REST para facturación electrónica con AFIP/ARCA Argentina.
+API REST para facturación electrónica con AFIP/ARCA Argentina (Facturas, NC y ND A/B/C).
 
 ---
 
-> **Nota:** Esta es una aplicación que desarrollé hace tiempo para mi uso personal. La documentación fue generada con ayuda de IA. La aplicación funciona correctamente y la utilizo activamente en mi negocio para generar **Facturas A y B**.
->
-> El uso es **completamente gratuito**. Si encuentran algún problema o quieren que agregue alguna funcionalidad, simplemente creen un **Issue** y lo reviso.
->
-> ¡Gracias por usar esta herramienta!
+> **Nota:** App de uso personal. Funciona para **Facturas A/B/C** y **notas de crédito/débito**. Uso gratuito; si hay un problema, abrí un **Issue**.
 
 ---
 
@@ -16,69 +12,83 @@ API REST para facturación electrónica con AFIP/ARCA Argentina.
 
 ```bash
 git clone <repo>
-cd afip-facturacion-api
+cd afip_app
 npm install
-```
-
-## Configuración
-
-```bash
 cp env.example .env
 ```
 
-Editar `.env`:
+En `.env`:
 
 ```env
-AFIP_CUIT=20123456789      # Tu CUIT (11 dígitos)
-AFIP_PTO_VTA=1             # Punto de venta habilitado
-PORT=5001                  # Puerto (opcional)
+AFIP_CUIT=20123456789      # default si el pedido no manda cuit
+AFIP_PTO_VTA=1             # default si el pedido no manda ptoVta
+PORT=5001
+# AFIP_API_SECRET=opcional  # si está, exige header X-Afip-Secret
 ```
 
-## Certificados
-
-Colocar en `src/servicios/certs/`:
+Certificados del emisor (no van al repo) en `src/servicios/certs/`:
 
 ```
-src/servicios/certs/
-├── key.key    # Clave privada
-└── cert.crt   # Certificado
+key.key
+cert.crt
 ```
 
-> 📄 **[Ver guía completa de certificados ARCA](CERTIFICADOS.md)** - Paso a paso para obtener tu certificado
-
-## Ejecutar
+> Guía: [CERTIFICADOS.md](CERTIFICADOS.md). En ARCA hay que autorizar el **computador fiscal** del servidor; si no, WSAA rechaza.
 
 ```bash
 npm start
-# o en desarrollo:
-npm run dev
+# producción:
+pm2 start app.js --name "afip-api"
 ```
 
 ---
 
-## API
+## Endpoints
 
-### `POST /afip/ticket`
+| Método | Ruta | Uso |
+|--------|------|-----|
+| `GET` | `/afip/tipos` | Tipos de comprobante soportados |
+| `POST` | `/afip/siguiente` | Próximo número (último + 1) |
+| `POST` | `/afip/emitir` | Emitir factura / NC / ND |
+| `POST` | `/afip/comprobante` | Consultar CAE (evita doble factura) |
+| `POST` | `/afip/ticket` | Compat: emitir con validación clásica |
+| `POST` | `/afip/ticket-test` | Prueba $100 Factura B CF |
+| `GET` | `/afip/contribuyente?cuit=` | Padrón |
+| `GET` | `/afip/condicion-iva?clase=` | Condiciones IVA (`A`/`B`/`C`) |
 
-Genera factura electrónica.
+En casi todos los POST van `cuit` y `ptoVta` en el body (si faltan, usa el `.env`).
 
-**Request:**
+---
+
+### `POST /afip/emitir`
+
+Factura B consumidor final (recargas):
 
 ```json
 {
-  "doctipo": 99,
-  "docnro": 0,
+  "cuit": "20123456789",
+  "ptoVta": 1,
   "monto": 1210,
-  "tipfac": 6
+  "tipfac": 6,
+  "doctipo": 99,
+  "docnro": 0
 }
 ```
 
-| Campo | Tipo | Descripción |
-|-------|------|-------------|
-| `doctipo` | int | Tipo documento: `80`=CUIT, `86`=CUIL, `96`=DNI, `99`=Consumidor Final |
-| `docnro` | int | Número de documento (0 para consumidor final) |
-| `monto` | number | Monto total con IVA incluido |
-| `tipfac` | int | Tipo factura: `1`=Factura A, `6`=Factura B |
+Nota de crédito B (asocia la factura original):
+
+```json
+{
+  "cuit": "20123456789",
+  "ptoVta": 1,
+  "tipfac": 8,
+  "monto": 1210,
+  "doctipo": 99,
+  "asociado": { "nro": 123, "tipfac": 6, "ptoVta": 1 }
+}
+```
+
+También sirve `cbtesAsoc: [{ "tipo": 6, "ptoVta": 1, "nro": 123 }]`.
 
 **Response:**
 
@@ -91,83 +101,47 @@ Genera factura electrónica.
     "voucherNumber": 1234,
     "montoTotal": 1210,
     "montoNeto": 1000,
-    "montoIVA": 210
+    "montoIVA": 210,
+    "CondicionIVAReceptorId": 5
   }
 }
 ```
 
----
-
-### `POST /afip/ticket-test`
-
-Genera factura de prueba ($100, Factura B, Consumidor Final).
-
-**Request:** ninguno
-
-**Response:** igual que `/afip/ticket`
+Si ARCA rechaza: `{ "success": false, "error": "...", "code": 10242 }`.
 
 ---
 
-### `GET /afip/contribuyente?cuit=XX`
-
-Consulta datos de contribuyente en padrón AFIP.
-
-**Response:**
+### `POST /afip/siguiente`
 
 ```json
-{
-  "success": true,
-  "data": {
-    "razonSocial": "EMPRESA SA",
-    "cuit": "20123456789",
-    "tipoPersona": "JURIDICA",
-    "condicionIVA": "Resp. Inscripto",
-    "tipoFactura": 1,
-    "domicilio": "Av. Corrientes 1234",
-    "localidad": "CABA",
-    "provincia": "CIUDAD AUTONOMA BUENOS AIRES",
-    "codigoPostal": "1043"
-  }
-}
+{ "cuit": "20123456789", "ptoVta": 1, "tipfac": 6 }
 ```
+
+### `POST /afip/comprobante`
+
+```json
+{ "cuit": "20123456789", "ptoVta": 1, "tipfac": 6, "nro": 1234 }
+```
+
+### `POST /afip/ticket`
+
+Igual que antes (`doctipo`, `docnro`, `monto`, `tipfac`) + `cuit`/`ptoVta` y, si es NC/ND, `asociado`.
 
 ---
 
-### `GET /afip/condicion-iva`
+## Tipos de comprobante (`tipfac`)
 
-Lista condiciones IVA disponibles.
+| Código | Tipo |
+|--------|------|
+| 1 / 2 / 3 | Factura / ND / NC **A** |
+| 6 / 7 / 8 | Factura / ND / NC **B** |
+| 11 / 12 / 13 | Factura / ND / NC **C** |
 
-**Query params:** `?clase=A` o `?clase=B` (opcional)
+NC/ND **obligan** comprobante asociado. Factura C se arma sin discriminación de IVA.
 
----
+Condición IVA por defecto: clase A → `1`; B/C consumidor final (`doctipo` 99) → `5`.
 
-## Ejemplos
-
-### Factura B - Consumidor Final
-
-```bash
-curl -X POST http://localhost:5001/afip/ticket \
-  -H "Content-Type: application/json" \
-  -d '{"doctipo":99,"docnro":0,"monto":1210,"tipfac":6}'
-```
-
-### Factura A - Responsable Inscripto
-
-```bash
-curl -X POST http://localhost:5001/afip/ticket \
-  -H "Content-Type: application/json" \
-  -d '{"doctipo":80,"docnro":20123456789,"monto":1210,"tipfac":1}'
-```
-
-### Consultar CUIT
-
-```bash
-curl "http://localhost:5001/afip/contribuyente?cuit=20123456789"
-```
-
----
-
-## Tipos de Documento
+## Tipos de documento
 
 | Código | Tipo |
 |--------|------|
@@ -176,30 +150,30 @@ curl "http://localhost:5001/afip/contribuyente?cuit=20123456789"
 | 96 | DNI |
 | 99 | Consumidor Final |
 
-## Tipos de Factura
-
-| Código | Tipo | Receptor |
-|--------|------|----------|
-| 1 | Factura A | Resp. Inscripto |
-| 6 | Factura B | Consumidor Final / Monotributo / Exento |
-
 ---
 
-## Certificados AFIP
-
-1. Ingresar a [AFIP](https://auth.afip.gob.ar/contribuyente_/)
-2. Ir a **Administrador de Relaciones de Clave Fiscal**
-3. Agregar servicio **WSFE - Factura Electrónica**
-4. Generar CSR y descargar certificado
-
----
-
-## Producción
+## Ejemplos
 
 ```bash
-npm install -g pm2
-pm2 start app.js --name "afip-api"
+# Factura B CF
+curl -X POST http://localhost:5001/afip/emitir \
+  -H "Content-Type: application/json" \
+  -d '{"cuit":"20123456789","ptoVta":1,"monto":1210,"tipfac":6,"doctipo":99,"docnro":0}'
+
+# Nota de crédito B
+curl -X POST http://localhost:5001/afip/emitir \
+  -H "Content-Type: application/json" \
+  -d '{"cuit":"20123456789","ptoVta":1,"monto":1210,"tipfac":8,"doctipo":99,"asociado":{"nro":123,"tipfac":6}}'
+
+# Consultar si ya salió el CAE
+curl -X POST http://localhost:5001/afip/comprobante \
+  -H "Content-Type: application/json" \
+  -d '{"cuit":"20123456789","ptoVta":1,"tipfac":6,"nro":1234}'
 ```
+
+Con secret: `-H "X-Afip-Secret: tu-secreto"`.
+
+---
 
 ## Licencia
 
