@@ -3,18 +3,7 @@ const path = require('path');
 const soap = require('soap');
 const forge = require('node-forge');
 const xml2js = require('xml2js');
-const moment = require('moment-timezone');
 
-// Configuración de logging
-const logInfo = (message, data = null) => {
-    // No hacer nada, solo para mantener la compatibilidad
-};
-
-const logError = (message, error = null) => {
-    // No hacer nada, solo para mantener la compatibilidad
-};
-
-// Configuración
 const PRIVATE_KEY_PATH = path.join(__dirname, '/certs/key.key');
 const CERT_PATH = path.join(__dirname, '/certs/cert.crt');
 const WSAA_WSDL = path.join(__dirname, './wsaa.wsdl');
@@ -22,44 +11,107 @@ const WSAA_URL = 'https://wsaa.afip.gov.ar/ws/services/LoginCms';
 const WSDL_WSFE = 'https://servicios1.afip.gov.ar/wsfev1/service.asmx?WSDL';
 const WSDL_CONSTANCIA = 'https://aws.afip.gov.ar/sr-padron/webservices/personaServiceA5?WSDL';
 
-// Cache para tokens
 const tokenCache = new Map();
-const TOKEN_CACHE_DURATION = 11 * 60 * 1000; // 11 minutos en milisegundos
+const TOKEN_CACHE_DURATION = 11 * 60 * 1000;
 
-// Función para limpiar el caché de tokens expirados
 const cleanExpiredTokens = () => {
     const now = Date.now();
     for (const [key, value] of tokenCache.entries()) {
         if (now - value.timestamp > TOKEN_CACHE_DURATION) {
             tokenCache.delete(key);
-            logInfo(`Token expirado eliminado para servicio: ${key}`);
         }
     }
 };
 
-// Limpiar caché cada minuto
 setInterval(cleanExpiredTokens, 60000);
 
-// Función para limpiar el caché de tokens
 function limpiarCacheTokens() {
-    logInfo('Limpiando caché de tokens');
     tokenCache.clear();
 }
 
-// Función para manejar errores de autenticación
+/** Extrae código/mensaje útil de respuestas o fallos de ARCA/AFIP. */
+function extraerErrorAfip(errorOrResult) {
+    if (!errorOrResult) return null;
+
+    const errors =
+        errorOrResult.Errors?.Err ||
+        errorOrResult.FECAESolicitarResult?.Errors?.Err ||
+        errorOrResult.FECompConsultarResult?.Errors?.Err ||
+        errorOrResult.FECompUltimoAutorizadoResult?.Errors?.Err ||
+        errorOrResult.FEParamGetCondicionIvaReceptorResult?.Errors?.Err;
+
+    if (errors) {
+        const list = Array.isArray(errors) ? errors : [errors];
+        if (list.length > 0) {
+            const e = list[0];
+            return {
+                code: e.Code ?? e.code ?? null,
+                message: e.Msg ?? e.msg ?? String(e),
+            };
+        }
+    }
+
+    const obs =
+        errorOrResult.FECAESolicitarResult?.FeDetResp?.FECAEDetResponse?.[0]?.Observaciones?.Obs ||
+        errorOrResult.Observaciones?.Obs;
+
+    if (obs) {
+        const list = Array.isArray(obs) ? obs : [obs];
+        if (list.length > 0) {
+            const o = list[0];
+            return {
+                code: o.Code ?? o.code ?? null,
+                message: o.Msg ?? o.msg ?? String(o),
+            };
+        }
+    }
+
+    if (errorOrResult.root?.Envelope?.Body?.Fault) {
+        const fault = errorOrResult.root.Envelope.Body.Fault;
+        return {
+            code: fault.faultcode || null,
+            message: fault.faultstring || 'Fault de AFIP',
+        };
+    }
+
+    if (errorOrResult.message) {
+        return { code: null, message: errorOrResult.message };
+    }
+
+    return null;
+}
+
+class AfipError extends Error {
+    constructor(code, message) {
+        super(message || 'Error de ARCA/AFIP');
+        this.name = 'AfipError';
+        this.code = code ?? null;
+        this.afip = true;
+    }
+}
+
+function throwIfAfipError(result, wrapperKey) {
+    const payload = wrapperKey ? result?.[wrapperKey] : result;
+    const err = extraerErrorAfip(payload) || extraerErrorAfip(result);
+    if (err && (payload?.Errors || result?.Errors)) {
+        throw new AfipError(err.code, err.message);
+    }
+}
+
 async function manejarErrorAutenticacion(error, service) {
     if (error.message && error.message.includes('alreadyAuthenticated')) {
-        logInfo('Error de autenticación existente detectado, limpiando caché y reintentando');
         limpiarCacheTokens();
         return await obtenerTokenSign(service);
+    }
+    const afipErr = extraerErrorAfip(error);
+    if (afipErr) {
+        throw new AfipError(afipErr.code, afipErr.message);
     }
     throw error;
 }
 
-// Generar CMS firmado
 function crearCMS(service) {
     try {
-        logInfo(`Generando CMS para servicio: ${service}`);
         const tra = `<?xml version="1.0" encoding="UTF-8"?>
         <loginTicketRequest version="1.0">
           <header>
@@ -83,160 +135,241 @@ function crearCMS(service) {
         });
         p7.sign();
 
-        const cms = Buffer.from(forge.asn1.toDer(p7.toAsn1()).getBytes(), 'binary').toString('base64');
-        logInfo('CMS generado exitosamente');
-        return cms;
+        return Buffer.from(forge.asn1.toDer(p7.toAsn1()).getBytes(), 'binary').toString('base64');
     } catch (error) {
-        logError('Error al crear CMS:', error);
-        throw new Error('Error al generar el ticket de autenticación');
+        throw new Error('Error al generar el ticket de autenticación (revisar certificado/key)');
     }
 }
 
-// Obtener Token y Sign con caché
 async function obtenerTokenSign(service) {
-    logInfo(`Solicitando token para servicio: ${service}`);
-    
     const cachedToken = tokenCache.get(service);
     if (cachedToken && Date.now() - cachedToken.timestamp < TOKEN_CACHE_DURATION) {
-        logInfo(`Usando token en caché para servicio: ${service}`);
         return cachedToken.credentials;
     }
 
     try {
-        // Intentar obtener el token existente primero
         const cms = crearCMS(service);
-        logInfo('Creando cliente SOAP para WSAA');
         const client = await soap.createClientAsync(WSAA_WSDL, { endpoint: WSAA_URL });
-        
-        logInfo('Solicitando login a WSAA');
+
         try {
             const [result] = await client.loginCmsAsync({ in0: cms });
-            logInfo('Parseando respuesta de WSAA');
             const parser = new xml2js.Parser({ explicitArray: false });
             const parsed = await parser.parseStringPromise(result.loginCmsReturn);
 
             const credentials = parsed.loginTicketResponse?.credentials;
             if (!credentials || !credentials.token || !credentials.sign) {
-                logError('Respuesta de WSAA inválida', parsed);
-                throw new Error('No se encontraron las credenciales en la respuesta del WSAA');
+                throw new AfipError(null, 'No se encontraron las credenciales en la respuesta del WSAA');
             }
 
-            // Guardar en caché
             tokenCache.set(service, {
                 credentials,
-                timestamp: Date.now()
+                timestamp: Date.now(),
             });
 
-            logInfo('Token obtenido y guardado en caché exitosamente');
             return credentials;
         } catch (error) {
-            // Si el error es de autenticación existente, intentar extraer el token
             if (error.message && error.message.includes('alreadyAuthenticated')) {
-                logInfo('Token ya autenticado detectado, intentando extraer credenciales');
                 try {
-                    // Intentar obtener el token del error
                     const errorResponse = error.root?.Envelope?.Body?.Fault?.detail;
-                    if (errorResponse) {
+                    if (errorResponse?.token && errorResponse?.sign) {
                         const credentials = {
                             token: errorResponse.token,
-                            sign: errorResponse.sign
+                            sign: errorResponse.sign,
                         };
-                        
-                        // Guardar en caché
                         tokenCache.set(service, {
                             credentials,
-                            timestamp: Date.now()
+                            timestamp: Date.now(),
                         });
-
-                        logInfo('Token extraído exitosamente del error de autenticación');
                         return credentials;
                     }
-                } catch (extractError) {
-                    logError('Error al extraer token del error:', extractError);
+                } catch (_) {
+                    /* continuar */
                 }
+            }
+
+            const afipErr = extraerErrorAfip(error);
+            if (afipErr) {
+                throw new AfipError(afipErr.code, afipErr.message);
             }
             throw error;
         }
     } catch (error) {
-        logError('Error al autenticar con WSAA:', error);
-        throw new Error('Error de autenticación con AFIP');
+        if (error.afip) throw error;
+        const afipErr = extraerErrorAfip(error);
+        if (afipErr) {
+            throw new AfipError(afipErr.code, afipErr.message);
+        }
+        throw new AfipError(
+            null,
+            error.message || 'Error de autenticación con AFIP/ARCA (computador fiscal autorizado?)'
+        );
     }
 }
 
-async function getLastVoucher(salesPoint, type) {
+async function getLastVoucher(cuit, salesPoint, type) {
     try {
         const { token, sign } = await obtenerTokenSign('wsfe');
-        
         const client = await soap.createClientAsync(WSDL_WSFE);
-        
+
         const args = {
             Auth: {
                 Token: token,
                 Sign: sign,
-                Cuit: process.env.AFIP_CUIT,
+                Cuit: cuit,
             },
             PtoVta: salesPoint,
             CbteTipo: type,
         };
 
         const [response] = await client.FECompUltimoAutorizadoAsync(args);
-        
+        throwIfAfipError(response, 'FECompUltimoAutorizadoResult');
+
         if (!response || !response.FECompUltimoAutorizadoResult) {
-            throw new Error('No se pudo obtener el último comprobante autorizado');
+            throw new AfipError(null, 'No se pudo obtener el último comprobante autorizado');
         }
-        
+
         return response.FECompUltimoAutorizadoResult.CbteNro;
     } catch (error) {
         if (error.message && error.message.includes('alreadyAuthenticated')) {
             return await manejarErrorAutenticacion(error, 'wsfe');
         }
+        if (error.afip) throw error;
+        const afipErr = extraerErrorAfip(error);
+        if (afipErr) throw new AfipError(afipErr.code, afipErr.message);
         throw error;
     }
 }
 
-async function createNextVoucher(data) {
+async function getNextVoucherNumber(cuit, salesPoint, type) {
+    const last = await getLastVoucher(cuit, salesPoint, type);
+    return Number(last) + 1;
+}
+
+async function consultarComprobante(cuit, ptoVta, cbteTipo, cbteNro) {
     try {
-        const lastVoucher = await getLastVoucher(data.FeCabReq.PtoVta, data.FeCabReq.CbteTipo);
-        const voucherNumber = lastVoucher + 1;
+        const { token, sign } = await obtenerTokenSign('wsfe');
+        const client = await soap.createClientAsync(WSDL_WSFE);
 
-        data.FeDetReq[0].CbteDesde = voucherNumber;
-        data.FeDetReq[0].CbteHasta = voucherNumber;
+        const args = {
+            Auth: {
+                Token: token,
+                Sign: sign,
+                Cuit: cuit,
+            },
+            FeCompConsReq: {
+                CbteTipo: cbteTipo,
+                CbteNro: cbteNro,
+                PtoVta: ptoVta,
+            },
+        };
 
-        const factura = await generarFactura(process.env.AFIP_CUIT, data);
+        const [response] = await client.FECompConsultarAsync(args);
+        const result = response?.FECompConsultarResult;
 
-        const detalleRespuesta = factura.FECAESolicitarResult?.FeDetResp?.FECAEDetResponse;
-        if (!detalleRespuesta || detalleRespuesta.length === 0) {
-            throw new Error('No se encontró la respuesta de detalle en FeDetResp');
+        if (result?.Errors?.Err) {
+            const err = extraerErrorAfip(result);
+            // 602 = no existe ese comprobante
+            if (err && (err.code === 602 || err.code === '602')) {
+                return { encontrado: false, code: err.code, message: err.message };
+            }
+            throw new AfipError(err?.code, err?.message || 'Error al consultar comprobante');
+        }
+
+        const det = result?.ResultGet;
+        if (!det) {
+            return { encontrado: false };
         }
 
         return {
-            CAE: detalleRespuesta[0].CAE,
-            CAEFchVto: detalleRespuesta[0].CAEFchVto,
-            voucherNumber: voucherNumber,
+            encontrado: true,
+            data: {
+                CAE: det.CodAutorizacion || det.CAE,
+                CAEFchVto: det.FchVto || det.CAEFchVto,
+                voucherNumber: det.CbteDesde || cbteNro,
+                CbteTipo: det.CbteTipo,
+                PtoVta: det.PtoVta,
+                DocTipo: det.DocTipo,
+                DocNro: det.DocNro,
+                ImpTotal: det.ImpTotal,
+                ImpNeto: det.ImpNeto,
+                ImpIVA: det.ImpIVA,
+                CbteFch: det.CbteFch,
+                Resultado: det.Resultado,
+            },
         };
     } catch (error) {
         if (error.message && error.message.includes('alreadyAuthenticated')) {
             return await manejarErrorAutenticacion(error, 'wsfe');
         }
+        if (error.afip) throw error;
+        const afipErr = extraerErrorAfip(error);
+        if (afipErr) throw new AfipError(afipErr.code, afipErr.message);
         throw error;
     }
 }
 
-async function consultarCondicionIvaReceptor(claseComprobante = null) {
+async function createNextVoucher(cuit, data) {
+    try {
+        const lastVoucher = await getLastVoucher(cuit, data.FeCabReq.PtoVta, data.FeCabReq.CbteTipo);
+        const voucherNumber = Number(lastVoucher) + 1;
+
+        data.FeDetReq[0].CbteDesde = voucherNumber;
+        data.FeDetReq[0].CbteHasta = voucherNumber;
+
+        const factura = await generarFactura(cuit, data);
+        const result = factura.FECAESolicitarResult;
+
+        if (result?.Errors?.Err) {
+            const err = extraerErrorAfip(result);
+            throw new AfipError(err?.code, err?.message || 'ARCA rechazó la solicitud');
+        }
+
+        const detalleRespuesta = result?.FeDetResp?.FECAEDetResponse;
+        const detalle = Array.isArray(detalleRespuesta) ? detalleRespuesta[0] : detalleRespuesta;
+
+        if (!detalle) {
+            throw new AfipError(null, 'No se encontró la respuesta de detalle en FeDetResp');
+        }
+
+        if (detalle.Resultado === 'R') {
+            const err = extraerErrorAfip({ FECAESolicitarResult: result }) ||
+                extraerErrorAfip(detalle);
+            throw new AfipError(
+                err?.code,
+                err?.message || 'ARCA rechazó el comprobante'
+            );
+        }
+
+        return {
+            CAE: detalle.CAE,
+            CAEFchVto: detalle.CAEFchVto,
+            voucherNumber,
+            Resultado: detalle.Resultado,
+        };
+    } catch (error) {
+        if (error.message && error.message.includes('alreadyAuthenticated')) {
+            return await manejarErrorAutenticacion(error, 'wsfe');
+        }
+        if (error.afip) throw error;
+        const afipErr = extraerErrorAfip(error);
+        if (afipErr) throw new AfipError(afipErr.code, afipErr.message);
+        throw error;
+    }
+}
+
+async function consultarCondicionIvaReceptor(cuit, claseComprobante = null) {
     try {
         const { token, sign } = await obtenerTokenSign('wsfe');
-        
         const client = await soap.createClientAsync(WSDL_WSFE);
 
         const req = {
             Auth: {
                 Token: token,
                 Sign: sign,
-                Cuit: process.env.AFIP_CUIT,
-            }
+                Cuit: cuit,
+            },
         };
 
-        // Agregar clase de comprobante si se proporciona
         if (claseComprobante) {
             req.ClaseCmp = claseComprobante;
         }
@@ -244,82 +377,74 @@ async function consultarCondicionIvaReceptor(claseComprobante = null) {
         const [response] = await client.FEParamGetCondicionIvaReceptorAsync(req);
 
         if (!response || !response.FEParamGetCondicionIvaReceptorResult) {
-            throw new Error('Error al obtener la condición IVA del receptor. Respuesta no válida.');
+            throw new AfipError(null, 'Error al obtener la condición IVA del receptor. Respuesta no válida.');
         }
 
         const result = response.FEParamGetCondicionIvaReceptorResult;
-        
-        // Verificar si hay errores
-        if (result.Errors && result.Errors.Err && result.Errors.Err.length > 0) {
-            const error = result.Errors.Err[0];
-            throw new Error(`Error de AFIP: ${error.Code} - ${error.Msg}`);
+
+        if (result.Errors && result.Errors.Err) {
+            const err = extraerErrorAfip(result);
+            throw new AfipError(err?.code, err?.message);
         }
 
-        // Validar que tenemos condiciones IVA
-        if (!result.ResultGet || !result.ResultGet.CondicionIvaReceptor || result.ResultGet.CondicionIvaReceptor.length === 0) {
-            throw new Error('No se encontraron condiciones IVA para el receptor');
+        const raw = result.ResultGet?.CondicionIvaReceptor;
+        if (!raw) {
+            throw new AfipError(null, 'No se encontraron condiciones IVA para el receptor');
         }
 
-        // Mapear las condiciones IVA a un formato más útil
-        const condicionesIva = result.ResultGet.CondicionIvaReceptor.map(condicion => ({
+        const list = Array.isArray(raw) ? raw : [raw];
+
+        return list.map((condicion) => ({
             Id: condicion.Id,
             Desc: condicion.Desc,
             Cmp_Clase: condicion.Cmp_Clase,
             FechaDesde: condicion.FechaDesde,
-            FechaHasta: condicion.FechaHasta
+            FechaHasta: condicion.FechaHasta,
         }));
-
-        return condicionesIva;
     } catch (error) {
         if (error.message && error.message.includes('alreadyAuthenticated')) {
             return await manejarErrorAutenticacion(error, 'wsfe');
         }
+        if (error.afip) throw error;
+        const afipErr = extraerErrorAfip(error);
+        if (afipErr) throw new AfipError(afipErr.code, afipErr.message);
         throw error;
     }
 }
 
+/**
+ * Condición IVA receptor por defecto según tipo de factura / documento.
+ * Factura B + Consumidor Final (99) => 5
+ * Factura A => 1 (IVA Responsable Inscripto) si no se indica otra
+ */
+function resolverCondicionIvaReceptorId(cbteTipo, docTipo, condicionIvaExplicit) {
+    if (condicionIvaExplicit !== undefined && condicionIvaExplicit !== null && condicionIvaExplicit !== '') {
+        return parseInt(condicionIvaExplicit, 10);
+    }
+    if (Number(cbteTipo) === 6 && Number(docTipo) === 99) {
+        return 5; // Consumidor Final
+    }
+    if (Number(cbteTipo) === 1) {
+        return 1; // IVA Responsable Inscripto
+    }
+    return 5;
+}
+
 async function generarFactura(cuitEmisor, datosFactura) {
     try {
-        // Obtener la condición IVA del receptor
-        const claseComprobante = datosFactura.FeCabReq.CbteTipo === 1 ? 'A' : 'B';
-        const condicionesIva = await consultarCondicionIvaReceptor(claseComprobante);
-        
-        // Verificar si el receptor tiene una condición IVA válida para el tipo de comprobante
-        const receptorValido = condicionesIva.some(condicion => 
-            condicion.Cmp_Clase === claseComprobante
-        );
-        
-        if (!receptorValido) {
-            throw new Error(`El receptor no tiene una condición IVA válida para comprobantes tipo ${claseComprobante}`);
-        }
-
-        // Obtener la condición IVA específica del receptor y verificar su vigencia
-        const condicionIvaReceptor = condicionesIva.find(condicion => 
-            condicion.Cmp_Clase === claseComprobante
-        );
-
-        // Verificar vigencia de la condición IVA
-        const fechaActual = new Date();
-        if (condicionIvaReceptor.FechaHasta && new Date(condicionIvaReceptor.FechaHasta) < fechaActual) {
-            throw new Error(`La condición IVA del receptor ha expirado el ${condicionIvaReceptor.FechaHasta}`);
-        }
-        
         const { token, sign } = await obtenerTokenSign('wsfe');
-        
         const client = await soap.createClientAsync(WSDL_WSFE, { disableCache: true });
 
         if (!Array.isArray(datosFactura.FeDetReq) || datosFactura.FeDetReq.length !== datosFactura.FeCabReq.CantReg) {
             throw new Error(`FeDetReq debe ser un array con exactamente ${datosFactura.FeCabReq.CantReg} elementos.`);
         }
 
-        const auth = {
-            Token: token,
-            Sign: sign,
-            Cuit: cuitEmisor,
-        };
-
         const request = {
-            Auth: auth,
+            Auth: {
+                Token: token,
+                Sign: sign,
+                Cuit: cuitEmisor,
+            },
             FeCAEReq: {
                 FeCabReq: {
                     CantReg: datosFactura.FeCabReq.CantReg,
@@ -327,28 +452,32 @@ async function generarFactura(cuitEmisor, datosFactura) {
                     CbteTipo: datosFactura.FeCabReq.CbteTipo,
                 },
                 FeDetReq: {
-                    FECAEDetRequest: datosFactura.FeDetReq.map(det => ({
-                        Concepto: det.Concepto,
-                        DocTipo: det.DocTipo,
-                        DocNro: det.DocNro,
-                        CbteDesde: det.CbteDesde,
-                        CbteHasta: det.CbteHasta,
-                        CbteFch: det.CbteFch,
-                        ImpTotal: det.ImpTotal,
-                        ImpTotConc: det.ImpTotConc,
-                        ImpNeto: det.ImpNeto,
-                        ImpOpEx: det.ImpOpEx,
-                        ImpTrib: det.ImpTrib,
-                        ImpIVA: det.ImpIVA,
-                        MonId: det.MonId,
-                        MonCotiz: det.MonCotiz,
-                        Iva: det.Iva ? { AlicIva: det.Iva } : undefined,
-                        // Agregar la condición IVA del receptor
-                        CondicionIvaReceptor: {
-                            Id: condicionIvaReceptor.Id,
-                            Desc: condicionIvaReceptor.Desc
-                        }
-                    })),
+                    FECAEDetRequest: datosFactura.FeDetReq.map((det) => {
+                        const condicionId = resolverCondicionIvaReceptorId(
+                            datosFactura.FeCabReq.CbteTipo,
+                            det.DocTipo,
+                            det.CondicionIVAReceptorId
+                        );
+
+                        return {
+                            Concepto: det.Concepto,
+                            DocTipo: det.DocTipo,
+                            DocNro: det.DocNro,
+                            CbteDesde: det.CbteDesde,
+                            CbteHasta: det.CbteHasta,
+                            CbteFch: det.CbteFch,
+                            ImpTotal: det.ImpTotal,
+                            ImpTotConc: det.ImpTotConc,
+                            ImpNeto: det.ImpNeto,
+                            ImpOpEx: det.ImpOpEx,
+                            ImpTrib: det.ImpTrib,
+                            ImpIVA: det.ImpIVA,
+                            MonId: det.MonId,
+                            MonCotiz: det.MonCotiz,
+                            CondicionIVAReceptorId: condicionId,
+                            Iva: det.Iva ? { AlicIva: det.Iva } : undefined,
+                        };
+                    }),
                 },
             },
         };
@@ -356,46 +485,88 @@ async function generarFactura(cuitEmisor, datosFactura) {
         const [response] = await client.FECAESolicitarAsync(request);
         return response;
     } catch (error) {
+        if (error.afip) throw error;
+        const afipErr = extraerErrorAfip(error);
+        if (afipErr) throw new AfipError(afipErr.code, afipErr.message);
         throw error;
     }
 }
 
-async function consultarConstancia(cuit) {
-    logInfo(`Consultando constancia para CUIT: ${cuit}`);
+async function consultarConstancia(cuitConsulta, cuitRepresentada) {
     try {
         const { token, sign } = await obtenerTokenSign('ws_sr_constancia_inscripcion');
-        
-        logInfo('Creando cliente SOAP para consulta de constancia');
         const client = await soap.createClientAsync(WSDL_CONSTANCIA);
-        
+
         const args = {
             token,
             sign,
-            cuitRepresentada: process.env.AFIP_CUIT,
-            idPersona: cuit,
+            cuitRepresentada: cuitRepresentada || cuitConsulta,
+            idPersona: cuitConsulta,
         };
 
-        logInfo('Enviando solicitud de constancia', args);
         const [result] = await client.getPersona_v2Async(args);
-        
+
         if (!result || !result.personaReturn) {
-            logError('Respuesta de constancia inválida', result);
-            throw new Error('No se encontraron datos del contribuyente');
+            throw new AfipError(null, 'No se encontraron datos del contribuyente');
         }
-        
-        logInfo('Constancia obtenida exitosamente', result.personaReturn);
+
         return result;
     } catch (error) {
-        logError('Error al consultar constancia:', error);
-        throw new Error('Error al consultar datos del contribuyente en AFIP');
+        if (error.afip) throw error;
+        const afipErr = extraerErrorAfip(error);
+        if (afipErr) throw new AfipError(afipErr.code, afipErr.message);
+        throw new AfipError(null, error.message || 'Error al consultar datos del contribuyente en AFIP');
     }
 }
 
-module.exports = { 
-    generarFactura, 
-    getLastVoucher, 
-    createNextVoucher, 
-    consultarConstancia,
-    consultarCondicionIvaReceptor 
-};
+/** Arma el payload FE de Factura B consumidor final (IVA 21% incluido en monto). */
+function armarFacturaConsumidorFinal({ cuit, ptoVta, monto, tipfac = 6, doctipo = 99, docnro = 0, condicionIva = 5 }) {
+    const montoNum = parseFloat(monto);
+    const neto = parseFloat((montoNum / 1.21).toFixed(2));
+    const iva = parseFloat((montoNum - neto).toFixed(2));
+    const fecha = new Date().toISOString().split('T')[0].replace(/-/g, '');
 
+    return {
+        cuit: String(cuit).replace(/[-\s]/g, ''),
+        montos: { montoTotal: montoNum, montoNeto: neto, montoIVA: iva },
+        datosFactura: {
+            FeCabReq: {
+                CbteTipo: parseInt(tipfac, 10),
+                CantReg: 1,
+                PtoVta: parseInt(ptoVta, 10),
+            },
+            FeDetReq: [
+                {
+                    Concepto: 1,
+                    DocTipo: parseInt(doctipo, 10),
+                    DocNro: parseInt(doctipo, 10) === 99 ? 0 : parseInt(docnro, 10),
+                    CbteFch: fecha,
+                    ImpTotal: montoNum,
+                    ImpTotConc: 0,
+                    ImpNeto: neto,
+                    ImpOpEx: 0,
+                    ImpTrib: 0,
+                    ImpIVA: iva,
+                    MonId: 'PES',
+                    MonCotiz: 1,
+                    CondicionIVAReceptorId: parseInt(condicionIva, 10),
+                    Iva: [{ Id: 5, BaseImp: neto, Importe: iva }],
+                },
+            ],
+        },
+    };
+}
+
+module.exports = {
+    AfipError,
+    extraerErrorAfip,
+    generarFactura,
+    getLastVoucher,
+    getNextVoucherNumber,
+    createNextVoucher,
+    consultarComprobante,
+    consultarConstancia,
+    consultarCondicionIvaReceptor,
+    armarFacturaConsumidorFinal,
+    resolverCondicionIvaReceptorId,
+};
