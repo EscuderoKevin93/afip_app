@@ -412,22 +412,83 @@ async function consultarCondicionIvaReceptor(cuit, claseComprobante = null) {
     }
 }
 
+/** Tipos de comprobante WSFE habituales (A/B/C + NC/ND). */
+const TIPOS_COMPROBANTE = {
+    1: { id: 1, letra: 'A', clase: 'A', kind: 'factura', desc: 'Factura A' },
+    2: { id: 2, letra: 'A', clase: 'A', kind: 'debito', desc: 'Nota de Débito A' },
+    3: { id: 3, letra: 'A', clase: 'A', kind: 'credito', desc: 'Nota de Crédito A' },
+    6: { id: 6, letra: 'B', clase: 'B', kind: 'factura', desc: 'Factura B' },
+    7: { id: 7, letra: 'B', clase: 'B', kind: 'debito', desc: 'Nota de Débito B' },
+    8: { id: 8, letra: 'B', clase: 'B', kind: 'credito', desc: 'Nota de Crédito B' },
+    11: { id: 11, letra: 'C', clase: 'C', kind: 'factura', desc: 'Factura C' },
+    12: { id: 12, letra: 'C', clase: 'C', kind: 'debito', desc: 'Nota de Débito C' },
+    13: { id: 13, letra: 'C', clase: 'C', kind: 'credito', desc: 'Nota de Crédito C' },
+};
+
+const TIPOS_COMPROBANTE_IDS = Object.keys(TIPOS_COMPROBANTE).map(Number);
+
+function getTipoComprobante(tipfac) {
+    return TIPOS_COMPROBANTE[Number(tipfac)] || null;
+}
+
+function esNotaCreditoODebito(tipfac) {
+    const t = getTipoComprobante(tipfac);
+    return Boolean(t && (t.kind === 'credito' || t.kind === 'debito'));
+}
+
+/** Factura “madre” sugerida para asociar NC/ND de la misma letra. */
+function facturaAsociadaSugerida(tipfac) {
+    const t = getTipoComprobante(tipfac);
+    if (!t) return null;
+    if (t.letra === 'A') return 1;
+    if (t.letra === 'B') return 6;
+    if (t.letra === 'C') return 11;
+    return null;
+}
+
+function listarTiposComprobante() {
+    return TIPOS_COMPROBANTE_IDS.map((id) => ({ ...TIPOS_COMPROBANTE[id] }));
+}
+
 /**
- * Condición IVA receptor por defecto según tipo de factura / documento.
- * Factura B + Consumidor Final (99) => 5
- * Factura A => 1 (IVA Responsable Inscripto) si no se indica otra
+ * Condición IVA receptor por defecto según tipo de comprobante / documento.
+ * A => 1 (RI); B/C + Consumidor Final (99) => 5; resto B/C => 5
  */
 function resolverCondicionIvaReceptorId(cbteTipo, docTipo, condicionIvaExplicit) {
     if (condicionIvaExplicit !== undefined && condicionIvaExplicit !== null && condicionIvaExplicit !== '') {
         return parseInt(condicionIvaExplicit, 10);
     }
-    if (Number(cbteTipo) === 6 && Number(docTipo) === 99) {
-        return 5; // Consumidor Final
+    const tipo = getTipoComprobante(cbteTipo);
+    if (tipo?.clase === 'A') {
+        return 1;
     }
-    if (Number(cbteTipo) === 1) {
-        return 1; // IVA Responsable Inscripto
+    if (Number(docTipo) === 99) {
+        return 5;
     }
     return 5;
+}
+
+function normalizarCbtesAsoc(cbtesAsoc, cuitEmisor) {
+    if (!cbtesAsoc) return undefined;
+
+    const lista = Array.isArray(cbtesAsoc) ? cbtesAsoc : [cbtesAsoc];
+    const mapped = lista
+        .map((c) => {
+            const Tipo = parseInt(c.Tipo ?? c.tipo ?? c.CbteTipo ?? c.tipfac, 10);
+            const PtoVta = parseInt(c.PtoVta ?? c.ptoVta ?? c.ptovta, 10);
+            const Nro = parseInt(c.Nro ?? c.nro ?? c.CbteNro ?? c.cbteNro, 10);
+            if (!Tipo || !PtoVta || !Nro) return null;
+
+            const item = { Tipo, PtoVta, Nro };
+            const cuitAsoc = String(c.Cuit ?? c.cuit ?? cuitEmisor ?? '').replace(/[-\s]/g, '');
+            if (/^\d{11}$/.test(cuitAsoc)) item.Cuit = cuitAsoc;
+            const fch = c.CbteFch ?? c.cbteFch ?? c.fecha;
+            if (fch) item.CbteFch = String(fch).replace(/-/g, '');
+            return item;
+        })
+        .filter(Boolean);
+
+    return mapped.length ? mapped : undefined;
 }
 
 async function generarFactura(cuitEmisor, datosFactura) {
@@ -459,7 +520,7 @@ async function generarFactura(cuitEmisor, datosFactura) {
                             det.CondicionIVAReceptorId
                         );
 
-                        return {
+                        const payload = {
                             Concepto: det.Concepto,
                             DocTipo: det.DocTipo,
                             DocNro: det.DocNro,
@@ -477,6 +538,13 @@ async function generarFactura(cuitEmisor, datosFactura) {
                             CondicionIVAReceptorId: condicionId,
                             Iva: det.Iva ? { AlicIva: det.Iva } : undefined,
                         };
+
+                        const asociados = normalizarCbtesAsoc(det.CbtesAsoc || det.cbtesAsoc, cuitEmisor);
+                        if (asociados) {
+                            payload.CbtesAsoc = { CbteAsoc: asociados };
+                        }
+
+                        return payload;
                     }),
                 },
             },
@@ -519,47 +587,127 @@ async function consultarConstancia(cuitConsulta, cuitRepresentada) {
     }
 }
 
-/** Arma el payload FE de Factura B consumidor final (IVA 21% incluido en monto). */
-function armarFacturaConsumidorFinal({ cuit, ptoVta, monto, tipfac = 6, doctipo = 99, docnro = 0, condicionIva = 5 }) {
+/** Arma el payload FE (factura / NC / ND). Monto con IVA 21% incluido. */
+function armarComprobante({
+    cuit,
+    ptoVta,
+    monto,
+    tipfac = 6,
+    doctipo = 99,
+    docnro = 0,
+    condicionIva,
+    cbtesAsoc,
+    asociado,
+    alicuota = 21,
+}) {
+    const tipFacNum = parseInt(tipfac, 10);
+    const tipo = getTipoComprobante(tipFacNum);
+    if (!tipo) {
+        throw new AfipError(null, `Tipo de comprobante no soportado: ${tipfac}`);
+    }
+
     const montoNum = parseFloat(monto);
-    const neto = parseFloat((montoNum / 1.21).toFixed(2));
-    const iva = parseFloat((montoNum - neto).toFixed(2));
+    const factor = 1 + Number(alicuota) / 100;
+    const esClaseC = tipo.clase === 'C';
+
+    // Factura C: monotributo / exento — sin discriminación de IVA en el WSFE típico
+    let neto;
+    let iva;
+    let ivaAlic;
+    if (esClaseC) {
+        neto = parseFloat(montoNum.toFixed(2));
+        iva = 0;
+        ivaAlic = undefined;
+    } else {
+        neto = parseFloat((montoNum / factor).toFixed(2));
+        iva = parseFloat((montoNum - neto).toFixed(2));
+        ivaAlic = [{ Id: 5, BaseImp: neto, Importe: iva }]; // Id 5 = 21%
+    }
+
     const fecha = new Date().toISOString().split('T')[0].replace(/-/g, '');
+    const docTipoNum = parseInt(doctipo, 10);
+    const condicion =
+        condicionIva !== undefined && condicionIva !== null && condicionIva !== ''
+            ? parseInt(condicionIva, 10)
+            : resolverCondicionIvaReceptorId(tipFacNum, docTipoNum, null);
+
+    let asociados = normalizarCbtesAsoc(cbtesAsoc, cuit);
+    if (!asociados && asociado) {
+        asociados = normalizarCbtesAsoc(
+            [
+                {
+                    tipo: asociado.tipo ?? asociado.tipfac ?? facturaAsociadaSugerida(tipFacNum),
+                    ptoVta: asociado.ptoVta ?? ptoVta,
+                    nro: asociado.nro ?? asociado.cbteNro,
+                    cuit: asociado.cuit ?? cuit,
+                    fecha: asociado.fecha ?? asociado.cbteFch,
+                },
+            ],
+            cuit
+        );
+    }
+
+    if (esNotaCreditoODebito(tipFacNum) && (!asociados || asociados.length === 0)) {
+        throw new AfipError(
+            null,
+            'Notas de crédito/débito requieren comprobante asociado (asociado o cbtesAsoc)'
+        );
+    }
+
+    const det = {
+        Concepto: 1,
+        DocTipo: docTipoNum,
+        DocNro: docTipoNum === 99 ? 0 : parseInt(docnro, 10),
+        CbteFch: fecha,
+        ImpTotal: montoNum,
+        ImpTotConc: 0,
+        ImpNeto: neto,
+        ImpOpEx: 0,
+        ImpTrib: 0,
+        ImpIVA: iva,
+        MonId: 'PES',
+        MonCotiz: 1,
+        CondicionIVAReceptorId: condicion,
+    };
+
+    if (ivaAlic) det.Iva = ivaAlic;
+    if (asociados) det.CbtesAsoc = asociados;
 
     return {
         cuit: String(cuit).replace(/[-\s]/g, ''),
+        tipo,
         montos: { montoTotal: montoNum, montoNeto: neto, montoIVA: iva },
         datosFactura: {
             FeCabReq: {
-                CbteTipo: parseInt(tipfac, 10),
+                CbteTipo: tipFacNum,
                 CantReg: 1,
                 PtoVta: parseInt(ptoVta, 10),
             },
-            FeDetReq: [
-                {
-                    Concepto: 1,
-                    DocTipo: parseInt(doctipo, 10),
-                    DocNro: parseInt(doctipo, 10) === 99 ? 0 : parseInt(docnro, 10),
-                    CbteFch: fecha,
-                    ImpTotal: montoNum,
-                    ImpTotConc: 0,
-                    ImpNeto: neto,
-                    ImpOpEx: 0,
-                    ImpTrib: 0,
-                    ImpIVA: iva,
-                    MonId: 'PES',
-                    MonCotiz: 1,
-                    CondicionIVAReceptorId: parseInt(condicionIva, 10),
-                    Iva: [{ Id: 5, BaseImp: neto, Importe: iva }],
-                },
-            ],
+            FeDetReq: [det],
         },
     };
+}
+
+/** Compat: Factura B consumidor final. */
+function armarFacturaConsumidorFinal(opts) {
+    return armarComprobante({
+        tipfac: 6,
+        doctipo: 99,
+        docnro: 0,
+        condicionIva: 5,
+        ...opts,
+    });
 }
 
 module.exports = {
     AfipError,
     extraerErrorAfip,
+    TIPOS_COMPROBANTE,
+    TIPOS_COMPROBANTE_IDS,
+    getTipoComprobante,
+    esNotaCreditoODebito,
+    facturaAsociadaSugerida,
+    listarTiposComprobante,
     generarFactura,
     getLastVoucher,
     getNextVoucherNumber,
@@ -567,6 +715,8 @@ module.exports = {
     consultarComprobante,
     consultarConstancia,
     consultarCondicionIvaReceptor,
+    armarComprobante,
     armarFacturaConsumidorFinal,
     resolverCondicionIvaReceptorId,
+    normalizarCbtesAsoc,
 };

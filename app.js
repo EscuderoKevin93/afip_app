@@ -12,7 +12,10 @@ const {
     consultarCondicionIvaReceptor,
     getNextVoucherNumber,
     consultarComprobante,
+    armarComprobante,
     armarFacturaConsumidorFinal,
+    listarTiposComprobante,
+    getTipoComprobante,
     AfipError,
 } = require('./src/servicios/afipService');
 
@@ -75,22 +78,32 @@ app.use(middlewareAfipSecret);
 app.get('/', (req, res) => {
     res.json({
         name: 'AFIP/ARCA Facturacion API',
-        version: '1.1.0',
+        version: '1.2.0',
         endpoints: {
+            'GET /afip/tipos': 'Tipos de comprobante (A/B/C, NC, ND)',
             'POST /afip/siguiente': 'Próximo número de comprobante',
-            'POST /afip/emitir': 'Emitir factura (recargas / CF)',
+            'POST /afip/emitir': 'Emitir factura / NC / ND',
             'POST /afip/comprobante': 'Consultar comprobante (evita doble factura)',
-            'POST /afip/ticket': 'Generar factura electrónica',
-            'POST /afip/ticket-test': 'Factura de prueba ($100)',
+            'POST /afip/ticket': 'Generar comprobante electrónico',
+            'POST /afip/ticket-test': 'Factura B de prueba ($100)',
             'GET /afip/contribuyente?cuit=XX': 'Consultar contribuyente',
             'GET /afip/condicion-iva': 'Condiciones IVA',
         },
+        tipfac: listarTiposComprobante(),
     });
 });
 
 app.use((req, res, next) => {
     if (req.path !== '/') logInfo(`${req.method} ${req.path}`);
     next();
+});
+
+/**
+ * GET /afip/tipos
+ * Lista Factura / NC / ND A-B-C soportados.
+ */
+app.get('/afip/tipos', (req, res) => {
+    res.json({ success: true, data: listarTiposComprobante() });
 });
 
 /**
@@ -109,11 +122,20 @@ app.post('/afip/siguiente', async (req, res) => {
         if (!ptoVta || ptoVta < 1) {
             return res.status(400).json({ success: false, error: 'ptoVta inválido' });
         }
+        if (!getTipoComprobante(tipfac)) {
+            return res.status(400).json({ success: false, error: `tipfac no soportado: ${tipfac}` });
+        }
 
         const siguiente = await getNextVoucherNumber(cuit, ptoVta, tipfac);
         res.json({
             success: true,
-            data: { cuit, ptoVta, tipfac, siguiente },
+            data: {
+                cuit,
+                ptoVta,
+                tipfac,
+                tipo: getTipoComprobante(tipfac),
+                siguiente,
+            },
         });
     } catch (error) {
         return responderErrorAfip(res, error, 'Error consultando siguiente comprobante');
@@ -122,13 +144,20 @@ app.post('/afip/siguiente', async (req, res) => {
 
 /**
  * POST /afip/emitir
- * Emite Factura B a consumidor final (doc 99, CondicionIVAReceptorId 5, IVA 21% incluido).
- * Body: { cuit, ptoVta, monto, doctipo?, docnro?, tipfac?, condicionIva? }
+ * Emite Factura / Nota de Crédito / Nota de Débito (A, B o C).
+ * Body: {
+ *   cuit, ptoVta, monto, tipfac?,
+ *   doctipo?, docnro?, condicionIva?,
+ *   asociado?: { nro, tipfac?, ptoVta?, fecha? },  // obligatorio en NC/ND
+ *   cbtesAsoc?: [{ tipo, ptoVta, nro, cuit?, fecha? }]
+ * }
+ * Default tipfac=6 Factura B CF (doc 99, CondicionIVAReceptorId 5).
  */
 app.post('/afip/emitir', async (req, res) => {
     try {
         const { cuit, ptoVta, src } = leerCuitPtoVta(req);
         const monto = parseFloat(src.monto);
+        const tipfac = parseInt(src.tipfac ?? 6, 10);
 
         if (!/^\d{11}$/.test(cuit)) {
             return res.status(400).json({ success: false, error: 'cuit inválido (11 dígitos)' });
@@ -139,20 +168,30 @@ app.post('/afip/emitir', async (req, res) => {
         if (isNaN(monto) || monto <= 0) {
             return res.status(400).json({ success: false, error: 'monto debe ser mayor a 0' });
         }
+        if (!getTipoComprobante(tipfac)) {
+            return res.status(400).json({ success: false, error: `tipfac no soportado: ${tipfac}` });
+        }
 
-        const armado = armarFacturaConsumidorFinal({
+        const armado = armarComprobante({
             cuit,
             ptoVta,
             monto,
-            tipfac: src.tipfac ?? 6,
-            doctipo: src.doctipo ?? 99,
+            tipfac,
+            doctipo: src.doctipo ?? (getTipoComprobante(tipfac).clase === 'A' ? 80 : 99),
             docnro: src.docnro ?? 0,
-            condicionIva: src.condicionIva ?? src.CondicionIVAReceptorId ?? 5,
+            condicionIva: src.condicionIva ?? src.CondicionIVAReceptorId,
+            asociado: src.asociado,
+            cbtesAsoc: src.cbtesAsoc || src.CbtesAsoc,
         });
 
         const resp = await createNextVoucher(armado.cuit, armado.datosFactura);
 
-        logInfo('Factura emitida', { CAE: resp.CAE, numero: resp.voucherNumber, monto });
+        logInfo('Comprobante emitido', {
+            CAE: resp.CAE,
+            numero: resp.voucherNumber,
+            tipfac,
+            monto,
+        });
 
         res.json({
             success: true,
@@ -161,12 +200,14 @@ app.post('/afip/emitir', async (req, res) => {
                 ...armado.montos,
                 cuit: armado.cuit,
                 ptoVta,
-                tipfac: armado.datosFactura.FeCabReq.CbteTipo,
+                tipfac,
+                tipo: armado.tipo,
                 CondicionIVAReceptorId: armado.datosFactura.FeDetReq[0].CondicionIVAReceptorId,
+                CbtesAsoc: armado.datosFactura.FeDetReq[0].CbtesAsoc || null,
             },
         });
     } catch (error) {
-        return responderErrorAfip(res, error, 'Error emitiendo factura');
+        return responderErrorAfip(res, error, 'Error emitiendo comprobante');
     }
 });
 
@@ -191,6 +232,9 @@ app.post('/afip/comprobante', async (req, res) => {
         if (!nro || nro < 1) {
             return res.status(400).json({ success: false, error: 'nro de comprobante inválido' });
         }
+        if (!getTipoComprobante(tipfac)) {
+            return res.status(400).json({ success: false, error: `tipfac no soportado: ${tipfac}` });
+        }
 
         const result = await consultarComprobante(cuit, ptoVta, tipfac, nro);
 
@@ -207,7 +251,10 @@ app.post('/afip/comprobante', async (req, res) => {
         res.json({
             success: true,
             encontrado: true,
-            data: result.data,
+            data: {
+                ...result.data,
+                tipo: getTipoComprobante(tipfac),
+            },
         });
     } catch (error) {
         return responderErrorAfip(res, error, 'Error consultando comprobante');
@@ -293,8 +340,16 @@ app.post('/afip/ticket-test', async (req, res) => {
 
 app.post('/afip/ticket', middlewareValidarFactura, async (req, res) => {
     try {
-        const { docTipoNum, docNroNum, tipFacNum, montoNum } = req.datosValidados;
-        const { cuit, ptoVta, src } = leerCuitPtoVta(req);
+        const {
+            docTipoNum,
+            docNroNum,
+            tipFacNum,
+            montoNum,
+            asociado,
+            cbtesAsoc,
+            condicionIva,
+        } = req.datosValidados;
+        const { cuit, ptoVta } = leerCuitPtoVta(req);
 
         if (!/^\d{11}$/.test(cuit) || !ptoVta) {
             return res.status(400).json({
@@ -303,25 +358,37 @@ app.post('/afip/ticket', middlewareValidarFactura, async (req, res) => {
             });
         }
 
-        const armado = armarFacturaConsumidorFinal({
+        const armado = armarComprobante({
             cuit,
             ptoVta,
             monto: montoNum,
             tipfac: tipFacNum,
             doctipo: docTipoNum,
             docnro: docNroNum,
-            condicionIva: src.condicionIva ?? src.CondicionIVAReceptorId ?? (tipFacNum === 6 && docTipoNum === 99 ? 5 : undefined),
+            condicionIva,
+            asociado,
+            cbtesAsoc,
         });
 
         const resp = await createNextVoucher(armado.cuit, armado.datosFactura);
-        logInfo('Factura generada', { CAE: resp.CAE, numero: resp.voucherNumber, monto: montoNum });
+        logInfo('Comprobante generado', {
+            CAE: resp.CAE,
+            numero: resp.voucherNumber,
+            tipfac: tipFacNum,
+            monto: montoNum,
+        });
 
         res.json({
             success: true,
-            data: { ...resp, ...armado.montos },
+            data: {
+                ...resp,
+                ...armado.montos,
+                tipfac: tipFacNum,
+                tipo: armado.tipo,
+            },
         });
     } catch (error) {
-        return responderErrorAfip(res, error, 'Error generando factura');
+        return responderErrorAfip(res, error, 'Error generando comprobante');
     }
 });
 
